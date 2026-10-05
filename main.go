@@ -4,6 +4,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -17,14 +18,14 @@ func main() {
 	// Инициализация JWT секретного ключа
 	InitAuth()
 
-	// TODO: Инициализация подключения к базе данных
+	// Инициализация подключения к базе данных
 	// Используйте функцию InitDB() из database.go
 	if err := InitDB(); err != nil {
 		log.Fatal("Failed to connect to database:", err)
 	}
 	defer CloseDB()
 
-	// TODO: Настройка HTTP маршрутов
+	// Настройка HTTP маршрутов
 	// Используйте обработчики из handlers.go
 	http.HandleFunc("/register", RegisterHandler)
 	http.HandleFunc("/login", LoginHandler)
@@ -39,7 +40,8 @@ func main() {
 	log.Printf("👤 Profile: GET http://localhost:%s/profile (requires token)", port)
 	log.Printf("❤️  Health: GET http://localhost:%s/health", port)
 
-	log.Fatal(http.ListenAndServe(":"+port, nil))
+	server := &http.Server{Addr: ":" + port, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 10 * time.Second, WriteTimeout: 15 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16 * 1024}
+	log.Fatal(server.ListenAndServe())
 }
 
 // getEnv получает значение переменной окружения или возвращает значение по умолчанию

@@ -1,160 +1,197 @@
 package main
 
 import (
+	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/lib/pq"
+	"io"
 	"log"
 	"net/http"
+	"regexp"
+	"strings"
+	"time"
 )
 
-// RegisterHandler обрабатывает регистрацию нового пользователя
+var usernamePattern = regexp.MustCompile(`^[a-zA-Z0-9_]{3,30}$`)
+
+// Выполняем bcrypt и для неизвестного email, уменьшая разницу во времени ответа.
+var dummyPasswordHash, _ = HashPassword("dummy-password-for-login")
+
+func requireMethod(w http.ResponseWriter, r *http.Request, method string) bool {
+	if r.Method == method {
+		return true
+	}
+	w.Header().Set("Allow", method)
+	sendErrorResponse(w, "Method not allowed", http.StatusMethodNotAllowed)
+	return false
+}
+
 func RegisterHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	if !requireMethod(w, r, http.MethodPost) {
 		return
 	}
-
-	// TODO: Реализуйте регистрацию пользователя
-	//
-	// Пошаговый план:
-	// 1. Распарсите JSON из тела запроса в структуру RegisterRequest
-	// 2. Проведите валидацию данных (email, username, password)
-	// 3. Проверьте, что пользователь с таким email не существует
-	// 4. Захешируйте пароль с помощью функции HashPassword()
-	// 5. Создайте пользователя в БД с помощью CreateUser()
-	// 6. Сгенерируйте JWT токен с помощью GenerateToken()
-	// 7. Верните ответ с токеном и данными пользователя
-	//
-	// Подсказки:
-	// - Используйте json.NewDecoder(r.Body).Decode() для парсинга JSON
-	// - Проверьте что все обязательные поля заполнены
-	// - При ошибках возвращайте соответствующие HTTP статусы
-	// - 400 для невалидных данных, 409 для дубликатов, 500 для внутренних ошибок
-	// - Не забудьте установить Content-Type: application/json для ответа
-
-	http.Error(w, "Registration not implemented", http.StatusNotImplemented)
-}
-
-// LoginHandler обрабатывает вход пользователя
-func LoginHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	r.Body = http.MaxBytesReader(w, r.Body, 8192)
+	var req RegisterRequest
+	if err := parseJSONRequest(r, &req); err != nil {
+		sendErrorResponse(w, "Invalid JSON request", 400)
 		return
 	}
-
-	// TODO: Реализуйте авторизацию пользователя
-	//
-	// Пошаговый план:
-	// 1. Распарсите JSON из тела запроса в структуру LoginRequest
-	// 2. Проведите базовую валидацию (email и password не пустые)
-	// 3. Найдите пользователя по email с помощью GetUserByEmail()
-	// 4. Проверьте пароль с помощью CheckPassword()
-	// 5. Сгенерируйте JWT токен с помощью GenerateToken()
-	// 6. Верните ответ с токеном и данными пользователя
-	//
-	// Важные моменты безопасности:
-	// - При неверном email или пароле возвращайте одинаковое сообщение
-	//   "Invalid email or password" чтобы не раскрывать существование email
-	// - Используйте HTTP статус 401 для неверных учетных данных
-	// - Не возвращайте password_hash в ответе
-
-	http.Error(w, "Login not implemented", http.StatusNotImplemented)
-}
-
-// ProfileHandler возвращает профиль текущего пользователя
-func ProfileHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	req.Username = strings.TrimSpace(req.Username)
+	if err := validateRegisterRequest(&req); err != nil {
+		sendErrorResponse(w, err.Error(), 400)
 		return
 	}
-
-	// TODO: Реализуйте получение профиля пользователя
-	//
-	// Пошаговый план:
-	// 1. Получите ID пользователя из контекста с помощью GetUserIDFromContext()
-	// 2. Загрузите данные пользователя из БД с помощью GetUserByID()
-	// 3. Верните данные пользователя в JSON формате
-	//
-	// Примечания:
-	// - Этот обработчик вызывается только после AuthMiddleware
-	// - Контекст уже должен содержать userID
-	// - Если пользователь не найден - верните 404
-	// - Не включайте password_hash в ответ
-
-	http.Error(w, "Profile not implemented", http.StatusNotImplemented)
-}
-
-// HealthHandler проверяет состояние сервиса
-func HealthHandler(w http.ResponseWriter, r *http.Request) {
-	// Проверяем подключение к БД
-	if db != nil {
-		if err := db.Ping(); err != nil {
-			http.Error(w, "Database connection failed", http.StatusServiceUnavailable)
+	exists, err := UserExistsByEmail(req.Email)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if exists {
+		sendErrorResponse(w, "Email or username already exists", 409)
+		return
+	}
+	hash, err := HashPassword(req.Password)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	user, err := CreateUser(req.Email, req.Username, hash)
+	if err != nil {
+		var pgErr *pq.Error
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			sendErrorResponse(w, "Email or username already exists", 409)
 			return
 		}
+		internalError(w, err)
+		return
 	}
-
-	// Возвращаем статус OK
-	w.Header().Set("Content-Type", "application/json")
-	response := map[string]string{
-		"status":  "ok",
-		"message": "Service is running",
-	}
-	json.NewEncoder(w).Encode(response)
+	sendAuthResponse(w, user, http.StatusCreated)
 }
 
-// sendJSONResponse отправляет JSON ответ (вспомогательная функция)
+func LoginHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodPost) {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 8192)
+	var req LoginRequest
+	if err := parseJSONRequest(r, &req); err != nil {
+		sendErrorResponse(w, "Invalid JSON request", 400)
+		return
+	}
+	req.Email = strings.ToLower(strings.TrimSpace(req.Email))
+	if err := validateLoginRequest(&req); err != nil {
+		sendErrorResponse(w, err.Error(), 400)
+		return
+	}
+	user, err := GetUserByEmail(req.Email)
+	if errors.Is(err, sql.ErrNoRows) {
+		CheckPassword(req.Password, dummyPasswordHash)
+		sendErrorResponse(w, "Invalid email or password", 401)
+		return
+	}
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	if !CheckPassword(req.Password, user.PasswordHash) {
+		sendErrorResponse(w, "Invalid email or password", 401)
+		return
+	}
+	sendAuthResponse(w, user, http.StatusOK)
+}
+
+func ProfileHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	id, ok := GetUserIDFromContext(r)
+	if !ok {
+		sendErrorResponse(w, "Unauthorized", 401)
+		return
+	}
+	user, err := GetUserByID(id)
+	if errors.Is(err, sql.ErrNoRows) {
+		sendErrorResponse(w, "User not found", 404)
+		return
+	}
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	sendJSONResponse(w, user, http.StatusOK)
+}
+
+func HealthHandler(w http.ResponseWriter, r *http.Request) {
+	if !requireMethod(w, r, http.MethodGet) {
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer cancel()
+	if db == nil || db.PingContext(ctx) != nil {
+		sendErrorResponse(w, "Database unavailable", 503)
+		return
+	}
+	sendJSONResponse(w, map[string]string{"status": "ok", "message": "Service is running"}, 200)
+}
+
+func sendAuthResponse(w http.ResponseWriter, user *User, status int) {
+	token, err := GenerateToken(*user)
+	if err != nil {
+		internalError(w, err)
+		return
+	}
+	sendJSONResponse(w, AuthResponse{Token: token, User: *user}, status)
+}
+
+func internalError(w http.ResponseWriter, err error) {
+	log.Printf("Request failed (%T)", err)
+	sendErrorResponse(w, "Internal server error", 500)
+}
+
 func sendJSONResponse(w http.ResponseWriter, data interface{}, statusCode int) {
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(statusCode)
 	if err := json.NewEncoder(w).Encode(data); err != nil {
-		log.Printf("Error encoding JSON response: %v", err)
-		http.Error(w, "Internal server error", http.StatusInternalServerError)
+		log.Printf("Encode response: %v", err)
 	}
 }
 
-// sendErrorResponse отправляет JSON ответ с ошибкой (вспомогательная функция)
 func sendErrorResponse(w http.ResponseWriter, message string, statusCode int) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(statusCode)
-	response := map[string]string{"error": message}
-	json.NewEncoder(w).Encode(response)
+	sendJSONResponse(w, map[string]string{"error": message}, statusCode)
 }
 
-// parseJSONRequest парсит JSON из тела запроса (вспомогательная функция)
 func parseJSONRequest(r *http.Request, v interface{}) error {
 	if r.Body == nil {
 		return fmt.Errorf("request body is empty")
 	}
 	defer r.Body.Close()
-
 	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields() // Строгая проверка полей
-
-	return decoder.Decode(v)
-}
-
-// validateRegisterRequest валидирует данные регистрации
-func validateRegisterRequest(req *RegisterRequest) error {
-	if req.Email == "" {
-		return fmt.Errorf("email is required")
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(v); err != nil {
+		return err
 	}
-	if req.Username == "" {
-		return fmt.Errorf("username is required")
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		return fmt.Errorf("expected a single JSON object")
 	}
-	if req.Password == "" {
-		return fmt.Errorf("password is required")
-	}
-
-	// TODO: Добавьте дополнительные проверки
-	// - Используйте ValidateEmail() и ValidatePassword() из auth.go
-	// - Проверьте длину username (например, минимум 3 символа)
-	// - Проверьте что username содержит только допустимые символы
-
 	return nil
 }
 
-// validateLoginRequest валидирует данные входа
+func validateRegisterRequest(req *RegisterRequest) error {
+	if err := ValidateEmail(req.Email); err != nil {
+		return err
+	}
+	if !usernamePattern.MatchString(req.Username) {
+		return fmt.Errorf("username must contain 3-30 ASCII letters, digits or underscores")
+	}
+	return ValidatePassword(req.Password)
+}
+
 func validateLoginRequest(req *LoginRequest) error {
 	if req.Email == "" {
 		return fmt.Errorf("email is required")
